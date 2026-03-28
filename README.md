@@ -30,7 +30,7 @@ streamlit run app.py
 
 ## 📂 Estrutura dos dados
 
-Os dados estão na pasta `/data`:
+Os dados estão divididos em 4 CSVs:
 
 * `dados.csv` → histórico de plantões
 * `ferias.csv` → controle de férias
@@ -39,7 +39,7 @@ Os dados estão na pasta `/data`:
 
 ## 🔗 Fonte alternativa
 
-Os dados também podem ser obtidos via Google Sheets:
+Os dados também podem ser obtidos via Google Sheets nas últimas 4 abas:
 https://docs.google.com/spreadsheets/d/1cvGJ2WLMaJNIXdmPbHkHfRIzE3Ph2DbBJs4otGtqn5E/edit
 
 ## 🧠 Tecnologias
