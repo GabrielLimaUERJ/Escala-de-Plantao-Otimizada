@@ -255,11 +255,11 @@ def _gerar_escala_interna(ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apo
         for nome in mapeamento_regioes
     }
 
-    historico_diurno     = {nome: [] for nome in mapeamento_regioes}
-    historico_especiais  = {nome: [] for nome in mapeamento_regioes}
+    historico_diurno         = {nome: [] for nome in mapeamento_regioes}
+    historico_especiais      = {nome: [] for nome in mapeamento_regioes}
     historico_noturno_semana = {nome: set() for nome in mapeamento_regioes}
-    historico_plantao    = {nome: [] for nome in mapeamento_regioes}
-    uso_mes              = {nome: 0  for nome in mapeamento_regioes}
+    historico_plantao        = {nome: [] for nome in mapeamento_regioes}
+    uso_mes                  = {nome: 0 for nome in mapeamento_regioes}
 
     # Controla o limite de 1 especial por pessoa por mês.
     # Quem está neste set NÃO pode receber um 2º especial,
@@ -276,40 +276,75 @@ def _gerar_escala_interna(ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apo
     # Ordem obrigatória: Recesso → Final de Semana → Noturno → Apoio
     # Quem faz um tipo NÃO pode fazer outro (max 1 especial/mês por pessoa).
     # Após o especial, a pessoa fica elegível para plantões diurnos.
+    #
+    # map_tipo define em qual(is) tipo(s) de dia o especial pode ocorrer:
+    #   - Recesso      → apenas dias de recesso
+    #   - Final de Semana → apenas fins de semana / feriados
+    #   - Noturno      → apenas dias úteis
+    #   - Apoio        → None = qualquer dia (não há restrição de tipo de dia)
     # ========================
 
     def map_tipo(tipo):
         return {
-            "Recesso": "recesso",
+            "Recesso":        "recesso",
             "Final de Semana": "final_semana",
-            "Noturno": "noturno",
-            "Apoio": "apoio"
+            "Noturno":        "noturno",
+            "Apoio":          None,   # ocorre em qualquer tipo de dia
         }.get(tipo)
 
     def preencher_tipo(tipo, quantidade):
         if quantidade == 0:
             return
 
-        base = (
-            df_long[df_long["tipo_plantao"] == tipo.upper()]
-            .sort_values("ultima_data")
-            .drop_duplicates(subset=["NOME"])
-        )
-        base = base.copy()
-        base["criticidade"] = base["NOME"].map(get_criticidade)
-        base["ruido"] = [_ruido() for _ in range(len(base))]
-        base = base.sort_values(
-            ["ultima_data", "criticidade", "ruido"],
-            ascending=[True, False, True]
-        )
+        tipo_dia_alvo = map_tipo(tipo)
+
+        # Para Apoio, usa todos os nomes do sistema como base (não depende de
+        # coluna APOIO preenchida no dados.csv, pois o Apoio é um papel de
+        # suporte atribuído a qualquer pessoa disponível).
+        # Para os demais, filtra quem tem data registrada para aquele tipo.
+        if tipo == "Apoio":
+            todos_nomes = list(mapeamento_regioes.keys())
+            base_nomes = pd.DataFrame({"NOME": todos_nomes})
+            # Ordena por criticidade desc, depois por nome para ser determinístico
+            base_nomes["criticidade"] = base_nomes["NOME"].map(get_criticidade)
+            base_nomes["ruido"] = [_ruido() for _ in range(len(base_nomes))]
+            base_nomes = base_nomes.sort_values(
+                ["criticidade", "ruido"],
+                ascending=[False, True]
+            )
+        else:
+            base_nomes = (
+                df_long[df_long["tipo_plantao"] == tipo.upper()]
+                .sort_values("ultima_data")
+                .drop_duplicates(subset=["NOME"])
+            )
+            base_nomes = base_nomes.copy()
+            base_nomes["criticidade"] = base_nomes["NOME"].map(get_criticidade)
+            base_nomes["ruido"] = [_ruido() for _ in range(len(base_nomes))]
+            base_nomes = base_nomes.sort_values(
+                ["ultima_data", "criticidade", "ruido"],
+                ascending=[True, False, True]
+            )
+
+        # fallback: todos os nomes do sistema
+        todos_nomes_fallback = list(mapeamento_regioes.keys())
 
         for data, info in agenda.items():
-            if info["tipo"] != map_tipo(tipo):
+
+            # Filtra pelo tipo de dia:
+            # - None (Apoio) → aceita qualquer tipo de dia
+            # - outro        → só o tipo correspondente
+            if tipo_dia_alvo is not None and info["tipo"] != tipo_dia_alvo:
                 continue
 
             while len(info[tipo]) < quantidade:
-                for _, row in base.iterrows():
+
+                selecionado = False
+
+                # ── 1ª passada: base normal ──────────────────────────────────
+                for _, row in base_nomes.iterrows():
                     nome = row["NOME"]
+
                     if (
                         nome not in ja_fez_especial
                         and not esta_de_ferias(nome, data)
@@ -329,8 +364,41 @@ def _gerar_escala_interna(ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apo
                             semana = data.isocalendar()[1]
                             historico_noturno_semana[nome].add(semana)
 
+                        selecionado = True
                         break
-                else:
+
+                # ── 2ª passada: fallback global ──────────────────────────────
+                if not selecionado:
+                    candidatos_fallback = sorted(
+                        todos_nomes_fallback,
+                        key=lambda n: (get_criticidade(n), uso_mes[n]),
+                        reverse=True
+                    )
+
+                    for nome in candidatos_fallback:
+                        if (
+                            nome not in ja_fez_especial
+                            and not esta_de_ferias(nome, data)
+                            and nome not in usados_dia[data]
+                        ):
+                            if any(abs((data - d).days) < INTERVALO_MINIMO for d in historico_diurno[nome]):
+                                continue
+
+                            info[tipo].append(nome)
+                            ja_fez_especial.add(nome)
+                            usados_dia[data].add(nome)
+                            contador[nome][tipo] += 1
+                            historico_especiais[nome].append(data)
+                            historico_plantao[nome].append(data)
+
+                            if tipo == "Noturno":
+                                semana = data.isocalendar()[1]
+                                historico_noturno_semana[nome].add(semana)
+
+                            selecionado = True
+                            break
+
+                if not selecionado:
                     break
 
     preencher_tipo("Recesso", qtd_recesso)
@@ -490,25 +558,23 @@ DIAS_PT = {
     "Friday": "sexta-feira", "Saturday": "sábado", "Sunday": "domingo",
 }
 
-# Paleta de cores (hex sem #)
 COR = {
-    "cab_data":    "4472C4",  # azul — cabeçalho datas
-    "cab_dia":     "D9E1F2",  # azul claro — cabeçalho dia da semana
-    "reg_label":   "2F4F4F",  # verde-escuro — label R1, R2…
-    "diurno_a":    "FFF2CC",  # amarelo claro — linhas pares de diurno
-    "diurno_b":    "FFFFFF",  # branco — linhas ímpares de diurno
-    "fds_bg":      "FFF0F0",  # rosado — coluna de fim de semana
-    "sep":         "F2F2F2",  # cinza — separador entre regiões
-    "ps_label":    "1F3864",  # azul muito escuro — label PS
-    "ps_noturno":  "BDD7EE",  # azul claro — noturno
-    "ps_fds":      "FCE4D6",  # salmão — final de semana
-    "ps_recesso":  "E2EFDA",  # verde claro — recesso
-    "ap_label":    "595959",  # cinza escuro — label AP
-    "ap_bg":       "F2F2F2",  # cinza claro — célula de apoio
+    "cab_data":   "4472C4",
+    "cab_dia":    "D9E1F2",
+    "reg_label":  "2F4F4F",
+    "diurno_a":   "FFF2CC",
+    "diurno_b":   "FFFFFF",
+    "fds_bg":     "FFF0F0",
+    "sep":        "F2F2F2",
+    "ps_label":   "1F3864",
+    "ps_noturno": "BDD7EE",
+    "ps_fds":     "FCE4D6",
+    "ps_recesso": "E2EFDA",
+    "ap_label":   "595959",
+    "ap_bg":      "F2F2F2",
 }
 
 def _f(hex_color):
-    """Cria um PatternFill sólido."""
     return PatternFill("solid", start_color=hex_color, fgColor=hex_color)
 
 def _b(style="thin", color="CCCCCC"):
@@ -529,10 +595,9 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
         for reg in regioes_ord
     }
 
-    # ── Cabeçalho linha 1: datas ──────────────────────────────────────────────
+    # Cabeçalho linha 1: datas
     ws.cell(row=1, column=1, value="").fill = _f(COR["reg_label"])
     ws.cell(row=1, column=1).border = _b()
-
     for ci, data in enumerate(datas_list, start=2):
         c = ws.cell(row=1, column=ci, value=data.strftime("%d/%m/%y"))
         c.font      = Font(bold=True, color="FFFFFF", size=10, name="Arial")
@@ -540,10 +605,9 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border    = _b()
 
-    # ── Cabeçalho linha 2: dia da semana ──────────────────────────────────────
-    ws.cell(row=2, column=1, value="").fill   = _f(COR["reg_label"])
+    # Cabeçalho linha 2: dia da semana
+    ws.cell(row=2, column=1, value="").fill = _f(COR["reg_label"])
     ws.cell(row=2, column=1).border = _b()
-
     for ci, data in enumerate(datas_list, start=2):
         dia = DIAS_PT.get(data.strftime("%A"), data.strftime("%A"))
         c = ws.cell(row=2, column=ci, value=dia)
@@ -552,17 +616,15 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border    = _b()
 
-    cur = 3  # linha atual
+    cur = 3
 
-    # ── Blocos de diurno por região ───────────────────────────────────────────
+    # Blocos de diurno por região
     for ri, reg in enumerate(regioes_ord):
-        n_slots = slots_por_regiao[reg]
+        n_slots    = slots_por_regiao[reg]
         cor_diurno = COR["diurno_a"] if ri % 2 == 0 else COR["diurno_b"]
 
         for slot in range(n_slots):
             row = cur + slot
-
-            # Coluna A: label da região (só na primeira linha do bloco)
             lc = ws.cell(row=row, column=1)
             lc.value     = reg if slot == 0 else ""
             lc.font      = Font(bold=True, color="FFFFFF", size=10, name="Arial")
@@ -575,7 +637,6 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
                 valor    = nomes[slot] if slot < len(nomes) else ""
                 tipo_dia = agenda[data]["tipo"]
                 bg = COR["fds_bg"] if tipo_dia in ("final_semana", "recesso") else cor_diurno
-
                 c = ws.cell(row=row, column=ci, value=valor)
                 c.fill      = _f(bg)
                 c.font      = Font(size=9, bold=bool(valor), name="Arial")
@@ -591,7 +652,7 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
             c.border = _b()
         cur += 1
 
-    # ── Linha PS (especiais, exceto Apoio) ────────────────────────────────────
+    # Linha PS (Recesso → FdS → Noturno)
     max_ps = max(
         max(
             len(agenda[d]["Recesso"]) +
@@ -604,7 +665,6 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
 
     for slot in range(max_ps):
         row = cur + slot
-
         lc = ws.cell(row=row, column=1)
         lc.value     = "PS" if slot == 0 else ""
         lc.font      = Font(bold=True, color="FFFFFF", size=10, name="Arial")
@@ -613,11 +673,10 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
         lc.border    = _b()
 
         for ci, data in enumerate(datas_list, start=2):
-            # Monta lista ordenada: Recesso → FdS → Noturno
             itens = (
-                [(n, "Recesso")      for n in agenda[data]["Recesso"]] +
+                [(n, "Recesso")         for n in agenda[data]["Recesso"]] +
                 [(n, "Final de Semana") for n in agenda[data]["Final de Semana"]] +
-                [(n, "Noturno")      for n in agenda[data]["Noturno"]]
+                [(n, "Noturno")         for n in agenda[data]["Noturno"]]
             )
             tipo_dia = agenda[data]["tipo"]
 
@@ -641,7 +700,7 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
 
     cur += max_ps
 
-    # ── Linha AP (Apoio) ──────────────────────────────────────────────────────
+    # Linha AP (Apoio)
     max_ap = max(
         max((len(agenda[d]["Apoio"]) for d in datas_list), default=0),
         1
@@ -649,7 +708,6 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
 
     for slot in range(max_ap):
         row = cur + slot
-
         lc = ws.cell(row=row, column=1)
         lc.value     = "AP" if slot == 0 else ""
         lc.font      = Font(bold=True, color="FFFFFF", size=10, name="Arial")
@@ -666,15 +724,13 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
             c.alignment = Alignment(horizontal="center", vertical="center")
             c.border    = _b()
 
-    # ── Larguras e alturas ────────────────────────────────────────────────────
+    # Larguras e alturas
     ws.column_dimensions["A"].width = 7
     for ci in range(2, n_datas + 2):
         ws.column_dimensions[get_column_letter(ci)].width = 18
 
     ws.row_dimensions[1].height = 18
     ws.row_dimensions[2].height = 14
-
-    # Congela cabeçalhos e coluna de label
     ws.freeze_panes = "B3"
 
     buf = io.BytesIO()
@@ -693,15 +749,15 @@ if st.button("🚀 Gerar Escala"):
         ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apoio, int(n_iteracoes)
     )
 
-    # --- Painel de pontuação da melhor escala ---
+    # Painel de pontuação
     st.subheader("🏆 Melhor Escala Encontrada")
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Especiais preenchidos",    melhor_score[0])
+    col1.metric("Especiais preenchidos",     melhor_score[0])
     col2.metric("Diurnos em datas críticas", melhor_score[1])
-    col3.metric("Aparições de críticos",    melhor_score[2])
-    col4.metric("Total de diurnos",         melhor_score[3])
+    col3.metric("Aparições de críticos",     melhor_score[2])
+    col4.metric("Total de diurnos",          melhor_score[3])
 
-    # --- Comparativo de todas as iterações ---
+    # Comparativo de iterações
     with st.expander("📊 Comparativo de todas as iterações"):
         def destacar_melhor(df):
             score_cols = [
@@ -710,7 +766,7 @@ if st.button("🚀 Gerar Escala"):
                 "Aparições de nomes críticos",
                 "Total de diurnos",
             ]
-            scores    = list(df[score_cols].itertuples(index=False, name=None))
+            scores     = list(df[score_cols].itertuples(index=False, name=None))
             idx_melhor = scores.index(max(scores))
             estilos = [
                 ["background-color: #d4edda; font-weight: bold"
@@ -724,14 +780,14 @@ if st.button("🚀 Gerar Escala"):
             use_container_width=True
         )
 
-    # --- Escala e contadores ---
+    # Escala e contadores
     st.subheader("📅 Escala")
     st.dataframe(df, use_container_width=True)
 
     st.subheader("📊 Contador de Plantões")
     st.dataframe(df_contador, use_container_width=True)
 
-    # --- Painel de criticidade ---
+    # Criticidade
     st.subheader("🚨 Índice de Criticidade por Pessoa")
     df_crit = pd.DataFrame([
         {"Nome": nome, "Dias de Férias": dias}
@@ -745,7 +801,7 @@ if st.button("🚀 Gerar Escala"):
     else:
         st.info("Nenhuma pessoa com férias marcadas no mês.")
 
-    # --- Exportar Excel formatado ---
+    # Exportar Excel
     st.subheader("📥 Exportar Planilha")
     excel_buf = gerar_excel(melhor_agenda, melhor_datas, mapeamento_regioes, config_regioes)
     st.download_button(
