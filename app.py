@@ -1,4 +1,5 @@
 import io
+import math
 import random
 import pandas as pd
 import streamlit as st
@@ -17,9 +18,6 @@ st.title("📅 Sistema de Escala")
 TIPOS_ESPECIAIS = ["Recesso", "Final de Semana", "Noturno", "Apoio"]
 INTERVALO_MINIMO = 6
 
-# Prioridade de dias da semana para plantões diurnos
-# weekday(): 0=seg, 1=ter, 2=qua, 3=qui, 4=sex, 5=sáb, 6=dom
-# Ordem de preenchimento: segunda > sexta > quarta > quinta > terça
 PRIORIDADE_DIA_SEMANA = {
     0: 1,  # segunda-feira  → prioridade 1 (maior)
     4: 2,  # sexta-feira    → prioridade 2
@@ -27,6 +25,9 @@ PRIORIDADE_DIA_SEMANA = {
     3: 4,  # quinta-feira   → prioridade 4
     1: 5,  # terça-feira    → prioridade 5 (menor)
 }
+
+# Apoio só ocorre em dias de plantão noturno e final de semana (nunca recesso)
+APOIO_TIPOS_VALIDOS = {"noturno", "final_semana"}
 
 # ========================
 # LOAD DATA
@@ -59,13 +60,6 @@ def carregar_ferias():
 
 @st.cache_data
 def calcular_criticidade():
-    """
-    Calcula o índice de criticidade de cada pessoa com base no número de
-    dias de férias marcados como True no ferias.csv.
-    Quanto mais dias de férias, mais crítica é a pessoa (menos dias disponíveis),
-    e maior deve ser sua prioridade de escalamento.
-    Retorna um dict {nome: dias_de_ferias} — valores maiores = mais crítico.
-    """
     df = pd.read_csv("ferias.csv")
     df.columns = df.columns.str.strip().str.upper()
     df["NOME"] = df["NOME"].astype(str).str.strip()
@@ -101,36 +95,94 @@ def carregar_calendario(ANO):
     return pd.DataFrame(eventos)
 
 
-df_long = carregar_dados()
-df_ferias = carregar_ferias()
+df_long            = carregar_dados()
+df_ferias          = carregar_ferias()
 mapeamento_regioes = carregar_regioes()
 criticidade_ferias = calcular_criticidade()
 
 # ========================
-# INPUTS
+# INPUTS — SIDEBAR
 # ========================
 
 st.sidebar.header("Configurações Gerais")
 
-ANO = st.sidebar.number_input("Ano", value=2026)
-MES = st.sidebar.number_input("Mês", value=4)
+ANO = st.sidebar.number_input("Ano",  value=2026)
+MES = st.sidebar.number_input("Mês",  value=4)
 
-qtd_recesso = st.sidebar.number_input("Recesso por dia", 0, 50, 2)
-qtd_final = st.sidebar.number_input("Final de Semana por dia", 0, 50, 2)
-qtd_noturno = st.sidebar.number_input("Noturno por dia", 0, 50, 2)
-qtd_apoio = st.sidebar.number_input("Apoio por dia", 0, 50, 0)
+qtd_recesso = st.sidebar.number_input("Recesso por dia",         0, 50, 2)
+qtd_final   = st.sidebar.number_input("Final de Semana por dia", 0, 50, 2)
+qtd_noturno = st.sidebar.number_input("Noturno por dia",         0, 50, 2)
+qtd_apoio   = st.sidebar.number_input("Apoio por dia",           0, 50, 0)
 
 n_iteracoes = st.sidebar.number_input(
     "Iterações para otimização",
-    min_value=1, max_value=50, value=10,
+    min_value=1, max_value=200, value=30,
     help=(
-        "Quantas vezes o algoritmo roda com variações para encontrar "
-        "o melhor resultado. Mais iterações = melhor resultado, porém mais lento."
+        "Quantas vezes o algoritmo roda com permutações aleatórias das listas "
+        "para encontrar o melhor resultado. Mais iterações = melhor resultado, "
+        "porém mais lento. Recomendado: 30–100."
     )
 )
 
 # ========================
-# CONFIG REGIÕES
+# PESOS DO SCORE — SIDEBAR
+#
+# Todos os critérios são normalizados para [0, 1] antes da ponderação,
+# eliminando distorções causadas por meses com mais ou menos dias especiais.
+# Os sliders abaixo controlam a importância relativa de cada critério.
+#
+# C1 – Cobertura das listas pré-geradas
+#      slots_especiais_alocados / slots_especiais_esperados
+#      Garante que o ciclo de rotação dos plantões especiais seja respeitado.
+#
+# C2 – Ausência de vagas vazias
+#      slots_preenchidos_total / slots_esperados_total  (especiais + diurnos)
+#      Penaliza qualquer dia com slot incompleto.
+#
+# C3 – Equilíbrio por pessoa
+#      1 − coeficiente_de_variação(plantões_por_pessoa)
+#      Quanto menor a variação entre pessoas, maior a nota. CV=0 → nota 1.
+#
+# C4 – Cobertura de datas críticas
+#      diurnos_em_dias_prioritários / máximo_possível
+#      Prioriza segundas, sextas e quartas (dias de mais mandados).
+#
+# C5 – Equilíbrio de oficiais por dia
+#      1 − coeficiente_de_variação(plantões_por_dia)
+#      Garante cobertura operacional mínima em emergências.
+# ========================
+
+st.sidebar.header("⚖️ Pesos do Score (ajuste por mês)")
+st.sidebar.caption(
+    "Os pesos são relativos entre si — não precisam somar 100. "
+    "Todos os critérios são normalizados para [0, 1] antes de serem ponderados, "
+    "então o score final é robusto a variações mensais na quantidade de dias especiais."
+)
+
+peso_cobertura_listas = st.sidebar.slider(
+    "P1 – Cobertura das listas especiais", 0, 100, 35,
+    help="% dos slots especiais preenchidos a partir da fila pré-gerada. "
+         "Valor alto garante que o ciclo de rotação seja respeitado."
+)
+peso_vagas_vazias = st.sidebar.slider(
+    "P2 – Ausência de vagas vazias", 0, 100, 25,
+    help="Penaliza dias com slots incompletos em qualquer tipo de plantão."
+)
+peso_equil_pessoa = st.sidebar.slider(
+    "P3 – Equilíbrio por pessoa", 0, 100, 20,
+    help="Quanto menor a variação de plantões entre pessoas, maior a nota."
+)
+peso_datas_criticas = st.sidebar.slider(
+    "P4 – Cobertura de datas críticas", 0, 100, 15,
+    help="Prioriza o preenchimento de plantões diurnos em segundas, sextas e quartas."
+)
+peso_equil_dia = st.sidebar.slider(
+    "P5 – Equilíbrio de oficiais por dia", 0, 100, 5,
+    help="Quanto menor a variação de plantões por dia, maior a nota."
+)
+
+# ========================
+# CONFIG REGIÕES — SIDEBAR
 # ========================
 
 regioes = sorted(set(mapeamento_regioes.values()))
@@ -150,7 +202,7 @@ for reg in regioes:
         config_regioes[reg] = {"diurnos_por_dia": qtd_diarios, "max_mes": max_mes}
 
 # ========================
-# FUNÇÕES
+# FUNÇÕES AUXILIARES
 # ========================
 
 def esta_de_ferias(nome, data):
@@ -181,47 +233,162 @@ def get_criticidade(nome):
 
 
 # ========================
-# PONTUAÇÃO (análise combinatória)
-# Critérios em ordem de prioridade (comparação lexicográfica):
-#   1. Especiais preenchidos no mês
-#   2. Diurnos em datas críticas preenchidos no mês
-#   3. Aparições de nomes críticos (com repetição) em especiais + diurnos
-#   4. Total de diurnos preenchidos no mês
+# SCORE PONDERADO NORMALIZADO
 # ========================
 
-def calcular_score(agenda):
-    especiais_preenchidos = sum(
-        len(info[tipo])
-        for info in agenda.values()
-        for tipo in TIPOS_ESPECIAIS
+def calcular_score_ponderado(agenda, datas, contador,
+                              qtd_recesso, qtd_final, qtd_noturno, qtd_apoio,
+                              pesos):
+    p1, p2, p3, p4, p5 = pesos
+    soma_pesos = p1 + p2 + p3 + p4 + p5
+    if soma_pesos == 0:
+        return 0.0, {}
+
+    datas_list = list(datas)
+
+    # Contagem de dias por tipo no mês
+    contagem_tipo_dia = {}
+    for d in datas_list:
+        t = agenda[d]["tipo"]
+        contagem_tipo_dia[t] = contagem_tipo_dia.get(t, 0) + 1
+
+    dias_apoio = (
+        contagem_tipo_dia.get("noturno", 0) +
+        contagem_tipo_dia.get("final_semana", 0)
     )
+
+    # ── C1: cobertura das listas especiais ─────────────────────────────────
+    slots_esp_esperados = (
+        qtd_recesso * contagem_tipo_dia.get("recesso", 0) +
+        qtd_final   * contagem_tipo_dia.get("final_semana", 0) +
+        qtd_noturno * contagem_tipo_dia.get("noturno", 0) +
+        qtd_apoio   * dias_apoio
+    )
+    slots_esp_preenchidos = sum(
+        len(agenda[d][t])
+        for d in datas_list
+        for t in ["Recesso", "Final de Semana", "Noturno", "Apoio"]
+    )
+    c1 = min(slots_esp_preenchidos / slots_esp_esperados, 1.0) if slots_esp_esperados > 0 else 1.0
+
+    # ── C2: ausência de vagas vazias (especiais + diurnos) ──────────────────
+    slots_diurnos_esperados = (
+        sum(config_regioes[reg]["diurnos_por_dia"] for reg in regioes) *
+        contagem_tipo_dia.get("noturno", 0)
+    )
+    slots_diurnos_preenchidos = sum(
+        sum(len(nomes) for nomes in agenda[d]["Diurno"].values())
+        for d in datas_list
+    )
+    slots_total_esperados   = slots_esp_esperados + slots_diurnos_esperados
+    slots_total_preenchidos = slots_esp_preenchidos + slots_diurnos_preenchidos
+    c2 = min(slots_total_preenchidos / slots_total_esperados, 1.0) if slots_total_esperados > 0 else 1.0
+
+    # ── C3: equilíbrio por pessoa ───────────────────────────────────────────
+    plantoes_pessoa = [
+        sum(cnts.values()) for cnts in contador.values()
+    ]
+    if len(plantoes_pessoa) > 1 and sum(plantoes_pessoa) > 0:
+        media  = sum(plantoes_pessoa) / len(plantoes_pessoa)
+        desvio = math.sqrt(sum((x - media) ** 2 for x in plantoes_pessoa) / len(plantoes_pessoa))
+        c3 = max(0.0, 1.0 - desvio / media)
+    else:
+        c3 = 1.0
+
+    # ── C4: cobertura de datas críticas ────────────────────────────────────
+    datas_criticas = [
+        d for d in datas_list
+        if d.weekday() in PRIORIDADE_DIA_SEMANA and agenda[d]["tipo"] == "noturno"
+    ]
+    max_criticos = sum(config_regioes[reg]["diurnos_por_dia"] for reg in regioes) * len(datas_criticas)
     diurnos_criticos = sum(
-        sum(len(nomes) for nomes in info["Diurno"].values())
-        for data, info in agenda.items()
-        if data.weekday() in PRIORIDADE_DIA_SEMANA
+        sum(len(nomes) for nomes in agenda[d]["Diurno"].values())
+        for d in datas_criticas
     )
-    nomes_criticos_count = 0
-    for info in agenda.values():
-        for tipo in TIPOS_ESPECIAIS:
-            for nome in info[tipo]:
-                if get_criticidade(nome) > 0:
-                    nomes_criticos_count += 1
-        for nomes in info["Diurno"].values():
-            for nome in nomes:
-                if get_criticidade(nome) > 0:
-                    nomes_criticos_count += 1
-    diurnos_total = sum(
-        sum(len(nomes) for nomes in info["Diurno"].values())
-        for info in agenda.values()
-    )
-    return (especiais_preenchidos, diurnos_criticos, nomes_criticos_count, diurnos_total)
+    c4 = min(diurnos_criticos / max_criticos, 1.0) if max_criticos > 0 else 1.0
+
+    # ── C5: equilíbrio de oficiais por dia ─────────────────────────────────
+    plantoes_dia = [
+        len(agenda[d]["Recesso"]) +
+        len(agenda[d]["Final de Semana"]) +
+        len(agenda[d]["Noturno"]) +
+        len(agenda[d]["Apoio"]) +
+        sum(len(nomes) for nomes in agenda[d]["Diurno"].values())
+        for d in datas_list
+    ]
+    if len(plantoes_dia) > 1 and sum(plantoes_dia) > 0:
+        media  = sum(plantoes_dia) / len(plantoes_dia)
+        desvio = math.sqrt(sum((x - media) ** 2 for x in plantoes_dia) / len(plantoes_dia))
+        c5 = max(0.0, 1.0 - desvio / media)
+    else:
+        c5 = 1.0
+
+    # ── Score final ponderado ───────────────────────────────────────────────
+    score = (p1 * c1 + p2 * c2 + p3 * c3 + p4 * c4 + p5 * c5) / soma_pesos
+
+    detalhes = {
+        "C1 Cobertura listas":   round(c1, 4),
+        "C2 Ausência vazios":    round(c2, 4),
+        "C3 Equilíbrio pessoa":  round(c3, 4),
+        "C4 Datas críticas":     round(c4, 4),
+        "C5 Equilíbrio dia":     round(c5, 4),
+        "Score final":           round(score, 6),
+    }
+    return score, detalhes
+
+
+# ========================
+# PRÉ-GERAÇÃO DE LISTAS POR TIPO
+# ========================
+
+def gerar_lista_especial(tipo, todos_nomes, rng):
+    """
+    Retorna lista ordenada de candidatos para um tipo especial.
+    Ordenação: data mais antiga → maior criticidade → ruído (só empates).
+    """
+    if tipo == "Apoio":
+        candidatos = [
+            {
+                "NOME": nome,
+                "ultima_data": pd.Timestamp("1900-01-01"),
+                "criticidade": get_criticidade(nome),
+                "ruido": rng.random(),
+            }
+            for nome in todos_nomes
+        ]
+    else:
+        tipo_col = tipo.upper()
+        sub = (
+            df_long[df_long["tipo_plantao"] == tipo_col]
+            .sort_values("ultima_data")
+            .drop_duplicates(subset=["NOME"])
+            .copy()
+        )
+        nomes_com_data = set(sub["NOME"].tolist())
+        nomes_sem_data = [n for n in todos_nomes if n not in nomes_com_data]
+
+        candidatos = []
+        for _, row in sub.iterrows():
+            candidatos.append({
+                "NOME": row["NOME"],
+                "ultima_data": row["ultima_data"],
+                "criticidade": get_criticidade(row["NOME"]),
+                "ruido": rng.random(),
+            })
+        for nome in nomes_sem_data:
+            candidatos.append({
+                "NOME": nome,
+                "ultima_data": pd.Timestamp("2099-12-31"),
+                "criticidade": get_criticidade(nome),
+                "ruido": rng.random(),
+            })
+
+    candidatos.sort(key=lambda x: (x["ultima_data"], -x["criticidade"], x["ruido"]))
+    return [c["NOME"] for c in candidatos]
 
 
 # ========================
 # GERADOR INTERNO
-# Aceita uma semente para controlar o ruído aleatório de desempate.
-# O ruído é aplicado APÓS os critérios principais (ultima_data, criticidade),
-# portanto só afeta empates — nunca quebra a ordem de prioridade.
 # ========================
 
 def _gerar_escala_interna(ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apoio, semente):
@@ -246,6 +413,7 @@ def _gerar_escala_interna(ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apo
         } for data in datas
     }
 
+    todos_nomes = list(mapeamento_regioes.keys())
     nomes_por_regiao = {}
     for nome, reg in mapeamento_regioes.items():
         nomes_por_regiao.setdefault(reg, []).append(nome)
@@ -255,173 +423,78 @@ def _gerar_escala_interna(ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apo
         for nome in mapeamento_regioes
     }
 
-    historico_diurno         = {nome: [] for nome in mapeamento_regioes}
-    historico_especiais      = {nome: [] for nome in mapeamento_regioes}
-    historico_noturno_semana = {nome: set() for nome in mapeamento_regioes}
-    historico_plantao        = {nome: [] for nome in mapeamento_regioes}
-    uso_mes                  = {nome: 0 for nome in mapeamento_regioes}
+    historico_diurno         = {nome: [] for nome in todos_nomes}
+    historico_especiais      = {nome: [] for nome in todos_nomes}
+    historico_noturno_semana = {nome: set() for nome in todos_nomes}
+    historico_plantao        = {nome: [] for nome in todos_nomes}
+    uso_mes                  = {nome: 0 for nome in todos_nomes}
+    ja_fez_especial          = set()
+    usados_dia               = {data: set() for data in datas}
 
-    # Controla o limite de 1 especial por pessoa por mês.
-    # Quem está neste set NÃO pode receber um 2º especial,
-    # mas PODE e DEVE ser considerado para plantões diurnos.
-    ja_fez_especial = set()
+    MAP_TIPO_DIA = {
+        "Recesso":         "recesso",
+        "Final de Semana": "final_semana",
+        "Noturno":         "noturno",
+        "Apoio":           None,  # filtrado por APOIO_TIPOS_VALIDOS
+    }
 
-    usados_dia = {data: set() for data in datas}
-
-    def _ruido():
-        return rng.uniform(0, 1e-9)
-
-    # ========================
-    # ESPECIAIS PRIMEIRO
-    # Ordem obrigatória: Recesso → Final de Semana → Noturno → Apoio
-    # Quem faz um tipo NÃO pode fazer outro (max 1 especial/mês por pessoa).
-    # Após o especial, a pessoa fica elegível para plantões diurnos.
-    #
-    # map_tipo define em qual(is) tipo(s) de dia o especial pode ocorrer:
-    #   - Recesso      → apenas dias de recesso
-    #   - Final de Semana → apenas fins de semana / feriados
-    #   - Noturno      → apenas dias úteis
-    #   - Apoio        → None = qualquer dia (não há restrição de tipo de dia)
-    # ========================
-
-    def map_tipo(tipo):
-        return {
-            "Recesso":        "recesso",
-            "Final de Semana": "final_semana",
-            "Noturno":        "noturno",
-            "Apoio":          None,   # ocorre em qualquer tipo de dia
-        }.get(tipo)
+    def elegivel_especial(nome, data, tipo):
+        if nome in ja_fez_especial:
+            return False
+        if esta_de_ferias(nome, data):
+            return False
+        if nome in usados_dia[data]:
+            return False
+        if any(abs((data - d).days) < INTERVALO_MINIMO for d in historico_diurno[nome]):
+            return False
+        return True
 
     def preencher_tipo(tipo, quantidade):
         if quantidade == 0:
             return
 
-        tipo_dia_alvo = map_tipo(tipo)
+        tipo_dia_alvo = MAP_TIPO_DIA[tipo]
+        fila = gerar_lista_especial(tipo, todos_nomes, rng)
 
-        # Para Apoio, usa todos os nomes do sistema como base (não depende de
-        # coluna APOIO preenchida no dados.csv, pois o Apoio é um papel de
-        # suporte atribuído a qualquer pessoa disponível).
-        # Para os demais, filtra quem tem data registrada para aquele tipo.
-        if tipo == "Apoio":
-            todos_nomes = list(mapeamento_regioes.keys())
-            base_nomes = pd.DataFrame({"NOME": todos_nomes})
-            # Ordena por criticidade desc, depois por nome para ser determinístico
-            base_nomes["criticidade"] = base_nomes["NOME"].map(get_criticidade)
-            base_nomes["ruido"] = [_ruido() for _ in range(len(base_nomes))]
-            base_nomes = base_nomes.sort_values(
-                ["criticidade", "ruido"],
-                ascending=[False, True]
-            )
-        else:
-            base_nomes = (
-                df_long[df_long["tipo_plantao"] == tipo.upper()]
-                .sort_values("ultima_data")
-                .drop_duplicates(subset=["NOME"])
-            )
-            base_nomes = base_nomes.copy()
-            base_nomes["criticidade"] = base_nomes["NOME"].map(get_criticidade)
-            base_nomes["ruido"] = [_ruido() for _ in range(len(base_nomes))]
-            base_nomes = base_nomes.sort_values(
-                ["ultima_data", "criticidade", "ruido"],
-                ascending=[True, False, True]
-            )
+        for data in datas:
+            # Filtro de tipo de dia
+            if tipo == "Apoio":
+                if agenda[data]["tipo"] not in APOIO_TIPOS_VALIDOS:
+                    continue
+            else:
+                if agenda[data]["tipo"] != tipo_dia_alvo:
+                    continue
 
-        # fallback: todos os nomes do sistema
-        todos_nomes_fallback = list(mapeamento_regioes.keys())
-
-        for data, info in agenda.items():
-
-            # Filtra pelo tipo de dia:
-            # - None (Apoio) → aceita qualquer tipo de dia
-            # - outro        → só o tipo correspondente
-            if tipo_dia_alvo is not None and info["tipo"] != tipo_dia_alvo:
+            slots_restantes = quantidade - len(agenda[data][tipo])
+            if slots_restantes <= 0:
                 continue
 
-            while len(info[tipo]) < quantidade:
+            i = 0
+            while i < len(fila) and slots_restantes > 0:
+                nome = fila[i]
+                if elegivel_especial(nome, data, tipo):
+                    agenda[data][tipo].append(nome)
+                    ja_fez_especial.add(nome)
+                    usados_dia[data].add(nome)
+                    contador[nome][tipo] += 1
+                    historico_especiais[nome].append(data)
+                    historico_plantao[nome].append(data)
 
-                selecionado = False
+                    if tipo == "Noturno":
+                        semana = data.isocalendar()[1]
+                        historico_noturno_semana[nome].add(semana)
 
-                # ── 1ª passada: base normal ──────────────────────────────────
-                for _, row in base_nomes.iterrows():
-                    nome = row["NOME"]
+                    fila.pop(i)
+                    slots_restantes -= 1
+                else:
+                    i += 1
 
-                    if (
-                        nome not in ja_fez_especial
-                        and not esta_de_ferias(nome, data)
-                        and nome not in usados_dia[data]
-                    ):
-                        if any(abs((data - d).days) < INTERVALO_MINIMO for d in historico_diurno[nome]):
-                            continue
-
-                        info[tipo].append(nome)
-                        ja_fez_especial.add(nome)
-                        usados_dia[data].add(nome)
-                        contador[nome][tipo] += 1
-                        historico_especiais[nome].append(data)
-                        historico_plantao[nome].append(data)
-
-                        if tipo == "Noturno":
-                            semana = data.isocalendar()[1]
-                            historico_noturno_semana[nome].add(semana)
-
-                        selecionado = True
-                        break
-
-                # ── 2ª passada: fallback global ──────────────────────────────
-                if not selecionado:
-                    candidatos_fallback = sorted(
-                        todos_nomes_fallback,
-                        key=lambda n: (get_criticidade(n), uso_mes[n]),
-                        reverse=True
-                    )
-
-                    for nome in candidatos_fallback:
-                        if (
-                            nome not in ja_fez_especial
-                            and not esta_de_ferias(nome, data)
-                            and nome not in usados_dia[data]
-                        ):
-                            if any(abs((data - d).days) < INTERVALO_MINIMO for d in historico_diurno[nome]):
-                                continue
-
-                            info[tipo].append(nome)
-                            ja_fez_especial.add(nome)
-                            usados_dia[data].add(nome)
-                            contador[nome][tipo] += 1
-                            historico_especiais[nome].append(data)
-                            historico_plantao[nome].append(data)
-
-                            if tipo == "Noturno":
-                                semana = data.isocalendar()[1]
-                                historico_noturno_semana[nome].add(semana)
-
-                            selecionado = True
-                            break
-
-                if not selecionado:
-                    break
-
-    preencher_tipo("Recesso", qtd_recesso)
+    preencher_tipo("Recesso",         qtd_recesso)
     preencher_tipo("Final de Semana", qtd_final)
-    preencher_tipo("Noturno", qtd_noturno)
-    preencher_tipo("Apoio", qtd_apoio)
+    preencher_tipo("Noturno",         qtd_noturno)
+    preencher_tipo("Apoio",           qtd_apoio)
 
-    # ========================
-    # DIURNO DEPOIS
-    # REGRA: quem fez especial PODE e DEVE fazer diurno também.
-    # ja_fez_especial NÃO é verificado aqui — apenas bloqueia 2º especial.
-    #
-    # Processamento por prioridade de dia da semana:
-    # segunda > sexta > quarta > quinta > terça
-    #
-    # Dentro de cada dia, candidatos ordenados por:
-    #   1. Já fez especial este mês (prioridade máxima — precisa de diurnos)
-    #   2. Menos diurnos no mês (distribuição equitativa)
-    #   3. Último plantão mais antigo (respeita quem faz mais tempo)
-    #   4. Mais crítico (desempate)
-    #   5. Ruído controlado (variação entre iterações, apenas em empates finais)
-    # ========================
-
+    # ── Diurnos ─────────────────────────────────────────────────────────────
     datas_diurnas = sorted(
         [data for data in datas if agenda[data]["tipo"] == "noturno"],
         key=lambda d: (prioridade_diurno(d), d)
@@ -431,7 +504,7 @@ def _gerar_escala_interna(ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apo
         semana = data.isocalendar()[1]
 
         for reg, nomes in nomes_por_regiao.items():
-            qtd     = config_regioes[reg]["diurnos_por_dia"]
+            qtd_reg = config_regioes[reg]["diurnos_por_dia"]
             max_mes = config_regioes[reg]["max_mes"]
             escolhidos = []
 
@@ -439,12 +512,12 @@ def _gerar_escala_interna(ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apo
                 df_long[df_long["NOME"].isin(nomes)]
                 .sort_values("ultima_data")
                 .drop_duplicates("NOME")
+                .copy()
             )
-            candidatos_base = candidatos_base.copy()
             candidatos_base["tem_especial"]  = candidatos_base["NOME"].map(lambda n: 1 if n in ja_fez_especial else 0)
             candidatos_base["criticidade"]   = candidatos_base["NOME"].map(get_criticidade)
             candidatos_base["uso_mes_atual"] = candidatos_base["NOME"].map(uso_mes)
-            candidatos_base["ruido"]         = [_ruido() for _ in range(len(candidatos_base))]
+            candidatos_base["ruido"]         = [rng.random() for _ in range(len(candidatos_base))]
             candidatos_base = candidatos_base.sort_values(
                 ["tem_especial", "uso_mes_atual", "ultima_data", "criticidade", "ruido"],
                 ascending=[False, True, True, False, True]
@@ -452,7 +525,7 @@ def _gerar_escala_interna(ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apo
 
             for _, row in candidatos_base.iterrows():
                 nome = row["NOME"]
-                if len(escolhidos) >= qtd:
+                if len(escolhidos) >= qtd_reg:
                     break
                 if esta_de_ferias(nome, data):
                     continue
@@ -499,16 +572,40 @@ def _formatar_resultado(agenda, datas, contador):
 
 
 # ========================
-# OTIMIZADOR
-# Roda N iterações com sementes diferentes e retorna a melhor escala
-# segundo a comparação lexicográfica dos 4 critérios de pontuação.
+# VISUALIZAÇÃO DAS LISTAS PRÉ-GERADAS
 # ========================
 
-def gerar_melhor_escala(ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apoio, n_iteracoes):
-    melhor_agenda   = None
-    melhor_datas    = None
-    melhor_contador = None
-    melhor_score    = (-1, -1, -1, -1)
+def gerar_df_listas(semente):
+    rng = random.Random(semente)
+    todos_nomes = list(mapeamento_regioes.keys())
+    listas = {}
+    max_len = 0
+    for tipo in ["Recesso", "Final de Semana", "Noturno", "Apoio"]:
+        lista = gerar_lista_especial(tipo, todos_nomes, rng)
+        listas[tipo] = lista
+        max_len = max(max_len, len(lista))
+
+    rows = []
+    for i in range(max_len):
+        row = {"#": i + 1}
+        for tipo in ["Recesso", "Final de Semana", "Noturno", "Apoio"]:
+            row[tipo] = listas[tipo][i] if i < len(listas[tipo]) else ""
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# ========================
+# OTIMIZADOR
+# ========================
+
+def gerar_melhor_escala(ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apoio,
+                         n_iteracoes, pesos):
+    melhor_agenda    = None
+    melhor_datas     = None
+    melhor_contador  = None
+    melhor_score     = -1.0
+    melhor_detalhes  = {}
+    melhor_semente   = 0
     historico_scores = []
 
     barra = st.progress(0, text="Calculando iterações...")
@@ -518,38 +615,45 @@ def gerar_melhor_escala(ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apoio
         agenda, datas, contador = _gerar_escala_interna(
             ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apoio, semente
         )
-        score = calcular_score(agenda)
+        score, detalhes = calcular_score_ponderado(
+            agenda, datas, contador,
+            qtd_recesso, qtd_final, qtd_noturno, qtd_apoio,
+            pesos
+        )
+
         historico_scores.append({
-            "Iteração": i + 1,
-            "Semente": semente,
-            "Especiais preenchidos": score[0],
-            "Diurnos em datas críticas": score[1],
-            "Aparições de nomes críticos": score[2],
-            "Total de diurnos": score[3],
+            "Iteração":             i + 1,
+            "Semente":              semente,
+            "Score final":          round(score, 6),
+            "C1 Cobertura listas":  detalhes.get("C1 Cobertura listas", 0),
+            "C2 Ausência vazios":   detalhes.get("C2 Ausência vazios", 0),
+            "C3 Equilíbrio pessoa": detalhes.get("C3 Equilíbrio pessoa", 0),
+            "C4 Datas críticas":    detalhes.get("C4 Datas críticas", 0),
+            "C5 Equilíbrio dia":    detalhes.get("C5 Equilíbrio dia", 0),
         })
+
         if score > melhor_score:
             melhor_score    = score
+            melhor_detalhes = detalhes
             melhor_agenda   = agenda
             melhor_datas    = datas
             melhor_contador = contador
+            melhor_semente  = semente
 
-        barra.progress((i + 1) / n_iteracoes, text=f"Iteração {i + 1}/{n_iteracoes}...")
+        barra.progress(
+            (i + 1) / n_iteracoes,
+            text=f"Iteração {i + 1}/{n_iteracoes} | Melhor score: {melhor_score:.4f}"
+        )
 
     barra.empty()
     df_resultado, df_contador = _formatar_resultado(melhor_agenda, melhor_datas, melhor_contador)
     df_scores = pd.DataFrame(historico_scores)
-    return df_resultado, df_contador, melhor_score, df_scores, melhor_agenda, melhor_datas
+    return (df_resultado, df_contador, melhor_score, melhor_detalhes,
+            df_scores, melhor_agenda, melhor_datas, melhor_semente)
 
 
 # ========================
 # EXPORTAÇÃO EXCEL
-# Layout inspirado na imagem de referência:
-#   - Linha 1: datas (dd/mm/aa) — fundo azul escuro, texto branco
-#   - Linha 2: dia da semana   — fundo azul claro
-#   - Blocos R1…Rn: uma linha por slot de diurno, alternando amarelo/branco
-#     fins de semana com fundo rosado; separador cinza entre regiões
-#   - Linha PS: plantões especiais, coloridos por tipo
-#   - Linha AP: apoio
 # ========================
 
 DIAS_PT = {
@@ -595,7 +699,7 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
         for reg in regioes_ord
     }
 
-    # Cabeçalho linha 1: datas
+    # Linha 1 — datas
     ws.cell(row=1, column=1, value="").fill = _f(COR["reg_label"])
     ws.cell(row=1, column=1).border = _b()
     for ci, data in enumerate(datas_list, start=2):
@@ -605,7 +709,7 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border    = _b()
 
-    # Cabeçalho linha 2: dia da semana
+    # Linha 2 — dia da semana
     ws.cell(row=2, column=1, value="").fill = _f(COR["reg_label"])
     ws.cell(row=2, column=1).border = _b()
     for ci, data in enumerate(datas_list, start=2):
@@ -645,14 +749,13 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
 
         cur += n_slots
 
-        # Separador cinza entre regiões
         for ci in range(1, n_datas + 2):
             c = ws.cell(row=cur, column=ci, value="")
             c.fill   = _f(COR["sep"])
             c.border = _b()
         cur += 1
 
-    # Linha PS (Recesso → FdS → Noturno)
+    # Linha PS
     max_ps = max(
         max(
             len(agenda[d]["Recesso"]) +
@@ -700,7 +803,7 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
 
     cur += max_ps
 
-    # Linha AP (Apoio)
+    # Linha AP
     max_ap = max(
         max((len(agenda[d]["Apoio"]) for d in datas_list), default=0),
         1
@@ -717,14 +820,13 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
 
         for ci, data in enumerate(datas_list, start=2):
             apoios = agenda[data]["Apoio"]
-            valor  = apoios[slot] if slot < len(apoios) else "Apoio"
+            valor  = apoios[slot] if slot < len(apoios) else ""
             c = ws.cell(row=row, column=ci, value=valor)
             c.fill      = _f(COR["ap_bg"])
             c.font      = Font(size=9, color="666666", name="Arial")
             c.alignment = Alignment(horizontal="center", vertical="center")
             c.border    = _b()
 
-    # Larguras e alturas
     ws.column_dimensions["A"].width = 7
     for ci in range(2, n_datas + 2):
         ws.column_dimensions[get_column_letter(ci)].width = 18
@@ -743,30 +845,70 @@ def gerar_excel(agenda, datas, mapeamento_regioes, config_regioes):
 # UI
 # ========================
 
+with st.expander("👁️ Prévia das listas de candidatos por tipo especial (semente 0)"):
+    st.caption(
+        "Estas são as filas base (semente 0) que alimentam o algoritmo. "
+        "Cada iteração aplica um ruído diferente nos empates, gerando variações. "
+        "Os nomes serão consumidos em ordem, com rollback se não puderem ser encaixados. "
+        "⚠️ O Apoio só ocorre em dias de plantão Noturno e Final de Semana — nunca em Recesso."
+    )
+    df_listas = gerar_df_listas(semente=0)
+    st.dataframe(df_listas, use_container_width=True, height=400)
+
 if st.button("🚀 Gerar Escala"):
 
-    df, df_contador, melhor_score, df_scores, melhor_agenda, melhor_datas = gerar_melhor_escala(
-        ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apoio, int(n_iteracoes)
+    pesos = (
+        peso_cobertura_listas,
+        peso_vagas_vazias,
+        peso_equil_pessoa,
+        peso_datas_criticas,
+        peso_equil_dia,
     )
 
-    # Painel de pontuação
-    st.subheader("🏆 Melhor Escala Encontrada")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Especiais preenchidos",     melhor_score[0])
-    col2.metric("Diurnos em datas críticas", melhor_score[1])
-    col3.metric("Aparições de críticos",     melhor_score[2])
-    col4.metric("Total de diurnos",          melhor_score[3])
+    (df, df_contador, melhor_score, melhor_detalhes,
+     df_scores, melhor_agenda, melhor_datas, melhor_semente) = gerar_melhor_escala(
+        ANO, MES, qtd_recesso, qtd_final, qtd_noturno, qtd_apoio,
+        int(n_iteracoes), pesos
+    )
 
-    # Comparativo de iterações
+    # ── Painel de pontuação ─────────────────────────────────────────────────
+    st.subheader("🏆 Melhor Escala Encontrada")
+
+    col_score, col_semente = st.columns([3, 1])
+    with col_score:
+        st.metric(
+            "Score final ponderado", f"{melhor_score:.4f}",
+            help="Score normalizado entre 0 e 1. Quanto mais próximo de 1, melhor."
+        )
+    with col_semente:
+        st.metric("Melhor semente", melhor_semente)
+
+    st.caption("Detalhamento dos componentes — cada valor entre 0 (ruim) e 1 (perfeito):")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("C1 Cobertura listas",  f"{melhor_detalhes.get('C1 Cobertura listas',  0):.3f}",
+              help="Slots especiais preenchidos / slots esperados")
+    c2.metric("C2 Ausência vazios",   f"{melhor_detalhes.get('C2 Ausência vazios',   0):.3f}",
+              help="Total de slots preenchidos / total esperado")
+    c3.metric("C3 Equilíbrio pessoa", f"{melhor_detalhes.get('C3 Equilíbrio pessoa', 0):.3f}",
+              help="1 − coef. de variação dos plantões por pessoa")
+    c4.metric("C4 Datas críticas",    f"{melhor_detalhes.get('C4 Datas críticas',    0):.3f}",
+              help="Diurnos em dias prioritários / máximo possível")
+    c5.metric("C5 Equilíbrio dia",    f"{melhor_detalhes.get('C5 Equilíbrio dia',    0):.3f}",
+              help="1 − coef. de variação dos plantões por dia")
+
+    # ── Listas da melhor iteração ───────────────────────────────────────────
+    with st.expander("📋 Listas de candidatos da melhor iteração"):
+        st.caption(
+            f"Listas geradas com semente {melhor_semente} — "
+            "estas foram as filas que produziram a melhor escala."
+        )
+        df_listas_melhor = gerar_df_listas(semente=melhor_semente)
+        st.dataframe(df_listas_melhor, use_container_width=True, height=400)
+
+    # ── Comparativo de iterações ────────────────────────────────────────────
     with st.expander("📊 Comparativo de todas as iterações"):
         def destacar_melhor(df):
-            score_cols = [
-                "Especiais preenchidos",
-                "Diurnos em datas críticas",
-                "Aparições de nomes críticos",
-                "Total de diurnos",
-            ]
-            scores     = list(df[score_cols].itertuples(index=False, name=None))
+            scores     = df["Score final"].tolist()
             idx_melhor = scores.index(max(scores))
             estilos = [
                 ["background-color: #d4edda; font-weight: bold"
@@ -780,14 +922,14 @@ if st.button("🚀 Gerar Escala"):
             use_container_width=True
         )
 
-    # Escala e contadores
+    # ── Escala e contadores ─────────────────────────────────────────────────
     st.subheader("📅 Escala")
     st.dataframe(df, use_container_width=True)
 
     st.subheader("📊 Contador de Plantões")
     st.dataframe(df_contador, use_container_width=True)
 
-    # Criticidade
+    # ── Criticidade ─────────────────────────────────────────────────────────
     st.subheader("🚨 Índice de Criticidade por Pessoa")
     df_crit = pd.DataFrame([
         {"Nome": nome, "Dias de Férias": dias}
@@ -801,7 +943,7 @@ if st.button("🚀 Gerar Escala"):
     else:
         st.info("Nenhuma pessoa com férias marcadas no mês.")
 
-    # Exportar Excel
+    # ── Exportar Excel ──────────────────────────────────────────────────────
     st.subheader("📥 Exportar Planilha")
     excel_buf = gerar_excel(melhor_agenda, melhor_datas, mapeamento_regioes, config_regioes)
     st.download_button(
