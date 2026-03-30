@@ -145,6 +145,5 @@ Este sistema automatiza esse processo, tornando a geração de escalas mais ráp
 * Redução de conflitos por questões subjetivas ou multiobjetivas
 * A quantidade de nomes disponíveis pode não ser suficiente
 * Nomes ausentes por férias ou licenças podem precisar de ajustes manuais para serem escalados
-* Exportação automática da escala
 * Interface de edição manual pós-geração
 * Deploy em ambiente web
