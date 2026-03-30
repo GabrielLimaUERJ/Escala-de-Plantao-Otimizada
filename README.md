@@ -141,7 +141,6 @@ Este sistema automatiza esse processo, tornando a geração de escalas mais ráp
 
 ## 🚀 Possíveis Melhorias
 
-* Sequência randomizada pode ser mais interessante
 * Redução de conflitos por questões subjetivas ou multiobjetivas
 * A quantidade de nomes disponíveis pode não ser suficiente
 * Nomes ausentes por férias ou licenças podem precisar de ajustes manuais para serem escalados
